@@ -1,0 +1,44 @@
+# Alertmanager routing. Out of the box alerts are collected (visible at
+# http://127.0.0.1:9093) but not sent anywhere. Uncomment ONE receiver block
+# below, fill it in, then: docker compose restart alertmanager
+
+global:
+  resolve_timeout: 5m
+  # --- Email (uncomment and fill for SMTP / Office 365) ---
+  # smtp_smarthost: "smtp.office365.com:587"
+  # smtp_from: "llm-alerts@example.com"
+  # smtp_auth_username: "llm-alerts@example.com"
+  # smtp_auth_password: "CHANGE_ME"
+  # smtp_require_tls: true
+
+route:
+  receiver: ops
+  group_by: ["alertname", "severity"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers: ['severity="critical"']
+      receiver: ops
+      repeat_interval: 1h
+
+receivers:
+  - name: ops
+    # email_configs:
+    #   - to: "ai-platform-oncall@example.com"
+    #     send_resolved: true
+    #
+    # Microsoft Teams (Workflows / incoming webhook URL):
+    # msteamsv2_configs:
+    #   - webhook_url: "https://<your-teams-workflow-url>"
+    #     send_resolved: true
+    #
+    # Generic webhook (Slack, PagerDuty bridge, ServiceNow, custom):
+    # webhook_configs:
+    #   - url: "https://hooks.example.com/alertmanager"
+    #     send_resolved: true
+
+inhibit_rules:
+  - source_matchers: ['alertname="VLLMDown"']
+    target_matchers: ['alertname=~"VLLM.+"']
+    equal: []

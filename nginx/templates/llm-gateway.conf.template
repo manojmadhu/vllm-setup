@@ -1,0 +1,139 @@
+# =============================================================================
+# LLM gateway — rendered at container start by the nginx image's envsubst
+# step into /etc/nginx/conf.d/llm-gateway.conf. ${VARS} come from compose.yaml.
+# =============================================================================
+
+# ---- Rate limiting & concurrency ---------------------------------------------
+# Per client API key (authenticated traffic)
+limit_req_zone  $api_client         zone=per_client:10m  rate=${RATE_LIMIT_PER_CLIENT};
+limit_conn_zone $api_client         zone=conn_client:10m;
+# Per source IP (slows key brute-forcing and noisy callers)
+limit_req_zone  $binary_remote_addr zone=per_ip:10m      rate=20r/s;
+
+limit_req_status  429;
+limit_conn_status 429;
+limit_req_log_level  warn;
+limit_conn_log_level warn;
+
+# ---- Upstream: vLLM on the internal Docker network ---------------------------
+resolver 127.0.0.11 valid=10s ipv6=off;
+
+upstream vllm_backend {
+    zone vllm_backend 64k;
+    server vllm:8000 resolve;     # re-resolves if the vllm container is recreated
+    keepalive 16;
+}
+
+# ---- Public (VNet) TLS listener ----------------------------------------------
+server {
+    listen 8443 ssl;
+    http2 on;
+    server_name ${GATEWAY_SERVER_NAME};
+
+    ssl_certificate     /etc/nginx/certs/tls.crt;
+    ssl_certificate_key /etc/nginx/certs/tls.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1h;
+    ssl_session_tickets off;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Request-Id $request_id always;
+
+    client_max_body_size ${MAX_BODY_SIZE};
+    client_body_buffer_size 1m;
+
+    error_page 401 = @unauthorized;
+    error_page 429 = @rate_limited;
+    error_page 502 503 504 = @upstream_unavailable;
+
+    # Liveness for load balancers / probes (no key required, IP rate-limited)
+    location = /health {
+        limit_req zone=per_ip burst=20 nodelay;
+        access_log off;
+        proxy_pass http://vllm_backend/health;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+    }
+
+    # Allow-list: only the inference endpoints your apps need.
+    # Everything else vLLM exposes (/metrics, /tokenize, /docs, admin/LoRA
+    # routes, ...) is unreachable from outside.
+    location ~ ^/v1/(chat/completions|completions|models)$ {
+        if ($api_client = "") {
+            return 401;
+        }
+
+        limit_req  zone=per_ip     burst=40 nodelay;
+        limit_req  zone=per_client burst=${RATE_LIMIT_BURST} nodelay;
+        limit_conn conn_client ${MAX_CONCURRENT_PER_CLIENT};
+
+        proxy_pass http://vllm_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        # Swap the client's key for the internal vLLM key.
+        proxy_set_header Authorization "Bearer ${VLLM_API_KEY}";
+        proxy_set_header X-Request-Id  $request_id;
+        proxy_set_header X-Client-Name $api_client;
+        proxy_set_header Host          $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+
+        # Streaming (SSE) friendly
+        proxy_buffering         off;
+        proxy_cache             off;
+        proxy_request_buffering on;
+        proxy_connect_timeout   10s;
+        proxy_send_timeout      ${UPSTREAM_TIMEOUT};
+        proxy_read_timeout      ${UPSTREAM_TIMEOUT};
+        chunked_transfer_encoding on;
+    }
+
+    location / {
+        default_type application/json;
+        return 404 '{"error":{"message":"Not found","type":"not_found"}}';
+    }
+
+    location @unauthorized {
+        default_type application/json;
+        add_header WWW-Authenticate "Bearer" always;
+        add_header X-Request-Id $request_id always;
+        return 401 '{"error":{"message":"Invalid or missing API key","type":"authentication_error"}}';
+    }
+
+    location @rate_limited {
+        default_type application/json;
+        add_header Retry-After 10 always;
+        add_header X-Request-Id $request_id always;
+        return 429 '{"error":{"message":"Rate limit exceeded, retry later","type":"rate_limit_error"}}';
+    }
+
+    location @upstream_unavailable {
+        default_type application/json;
+        add_header Retry-After 30 always;
+        add_header X-Request-Id $request_id always;
+        return 503 '{"error":{"message":"Model is starting or unavailable","type":"service_unavailable"}}';
+    }
+}
+
+# ---- Internal status endpoint for the Prometheus nginx exporter --------------
+server {
+    listen 8081;
+    access_log off;
+
+    location = /nginx_status {
+        stub_status;
+        allow 127.0.0.1;
+        allow 10.0.0.0/8;
+        allow 172.16.0.0/12;
+        allow 192.168.0.0/16;
+        deny  all;
+    }
+
+    location / {
+        return 404;
+    }
+}

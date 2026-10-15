@@ -1,0 +1,4 @@
+.env
+nginx/api-keys/keys.map
+nginx/certs/*.key
+nginx/certs/*.crt

@@ -1,0 +1,241 @@
+# =============================================================================
+# Enterprise vLLM stack — Docker Compose
+# Target: Azure Linux VM with one 16 GB NVIDIA GPU (e.g. NC4as_T4_v3 / Tesla T4)
+#
+# Network design
+#   llm_internal  internal-only bridge (NO internet, NO published ports)
+#                 vllm  <->  gateway  <->  prometheus / nginx-exporter
+#   monitoring    normal bridge for observability tools; ports published on
+#                 127.0.0.1 only (reach them through an SSH tunnel)
+#   egress        normal bridge used only by the one-off model download job
+#
+# The vLLM port (8000) is never published on the host. The only way in is the
+# Nginx gateway on 443 (TLS + client API keys + rate limiting).
+# =============================================================================
+
+name: vllm
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  restart: unless-stopped
+  logging: *default-logging
+
+networks:
+  llm_internal:
+    internal: true
+  monitoring: {}
+  egress: {}
+
+volumes:
+  hf_cache: {}
+  vllm_cache: {}
+  prometheus_data: {}
+  grafana_data: {}
+  alertmanager_data: {}
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # One-off job: download model weights into the hf_cache volume.
+  # Run with:  docker compose --profile setup run --rm model-download
+  # vLLM itself runs fully offline afterwards.
+  # ---------------------------------------------------------------------------
+  model-download:
+    image: ${VLLM_IMAGE}
+    profiles: ["setup"]
+    networks: [egress]
+    entrypoint: ["python3", "-c"]
+    command:
+      - |
+        import os
+        from huggingface_hub import snapshot_download
+        repo = os.environ["MODEL_ID"]
+        path = snapshot_download(repo_id=repo, token=os.environ.get("HF_TOKEN") or None)
+        print(f"Downloaded {repo} -> {path}")
+    environment:
+      MODEL_ID: ${MODEL_ID}
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_HUB_ENABLE_HF_TRANSFER: "0"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # vLLM inference server (OpenAI-compatible API on :8000, internal only)
+  # ---------------------------------------------------------------------------
+  vllm:
+    <<: *hardening
+    image: ${VLLM_IMAGE}
+    networks: [llm_internal]
+    # No "ports:" section on purpose — vLLM is unreachable from the host/VNet.
+    entrypoint: ["vllm", "serve"]
+    command:
+      - ${MODEL_ID}
+      - --host=0.0.0.0
+      - --port=8000
+      - --served-model-name=${SERVED_MODEL_NAME}
+      - --api-key=${VLLM_API_KEY}
+      - --quantization=${QUANTIZATION}
+      - --dtype=${DTYPE}
+      - --max-model-len=${MAX_MODEL_LEN}
+      - --max-num-seqs=${MAX_NUM_SEQS}
+      - --max-num-batched-tokens=${MAX_NUM_BATCHED_TOKENS}
+      - --gpu-memory-utilization=${GPU_MEMORY_UTILIZATION}
+      - --enable-prefix-caching
+      - --enable-auto-tool-choice
+      - --tool-call-parser=${TOOL_CALL_PARSER}
+      - --max-num-queued-reqs=${MAX_NUM_QUEUED_REQS}
+      # Add tuning flags here if needed, e.g. on out-of-memory at startup:
+      # - --enforce-eager
+    environment:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      VLLM_NO_USAGE_STATS: "1"
+      DO_NOT_TRACK: "1"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+      - vllm_cache:/root/.cache/vllm
+    shm_size: "8gb"
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 900s   # first start compiles kernels / CUDA graphs
+
+  # ---------------------------------------------------------------------------
+  # Nginx gateway: TLS termination, client API keys, rate limiting,
+  # endpoint allow-list, request logging. The ONLY published API port.
+  # ---------------------------------------------------------------------------
+  gateway:
+    <<: *hardening
+    image: ${NGINX_IMAGE}
+    networks: [llm_internal, monitoring]
+    depends_on:
+      vllm:
+        condition: service_started
+    ports:
+      - "${GATEWAY_BIND_IP}:443:8443"
+    environment:
+      VLLM_API_KEY: ${VLLM_API_KEY}
+      GATEWAY_SERVER_NAME: ${GATEWAY_SERVER_NAME}
+      RATE_LIMIT_PER_CLIENT: ${RATE_LIMIT_PER_CLIENT}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST}
+      MAX_CONCURRENT_PER_CLIENT: ${MAX_CONCURRENT_PER_CLIENT}
+      MAX_BODY_SIZE: ${MAX_BODY_SIZE}
+      UPSTREAM_TIMEOUT: ${UPSTREAM_TIMEOUT}
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/templates:/etc/nginx/templates:ro
+      - ./nginx/api-keys:/etc/nginx/api-keys:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8081/nginx_status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Monitoring
+  # ---------------------------------------------------------------------------
+  prometheus:
+    <<: *hardening
+    image: ${PROMETHEUS_IMAGE}
+    networks: [llm_internal, monitoring]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION}
+      - --web.enable-lifecycle
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+
+  alertmanager:
+    <<: *hardening
+    image: ${ALERTMANAGER_IMAGE}
+    networks: [monitoring]
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    ports:
+      - "127.0.0.1:9093:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+
+  grafana:
+    <<: *hardening
+    image: ${GRAFANA_IMAGE}
+    networks: [monitoring]
+    depends_on: [prometheus]
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_SECURITY_COOKIE_SECURE: "false"   # served over SSH tunnel on localhost
+      GF_SERVER_ROOT_URL: http://127.0.0.1:3000/
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+
+  node-exporter:
+    <<: *hardening
+    image: ${NODE_EXPORTER_IMAGE}
+    networks: [monitoring]
+    pid: host
+    command:
+      - --path.rootfs=/host
+    volumes:
+      - /:/host:ro,rslave
+
+  dcgm-exporter:
+    <<: *hardening
+    image: ${DCGM_EXPORTER_IMAGE}
+    networks: [monitoring]
+    cap_add:
+      - SYS_ADMIN
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  nginx-exporter:
+    <<: *hardening
+    image: ${NGINX_EXPORTER_IMAGE}
+    networks: [monitoring]
+    depends_on: [gateway]
+    command:
+      - --nginx.scrape-uri=http://gateway:8081/nginx_status
